@@ -1,0 +1,278 @@
+"""Training configuration for the European (N0/N1) and American (N2) PINNs.
+
+`lambda_pde` is the one flag that turns `EuropeanPINNConfig` into either N0
+or N1 from the model ladder in `RESEARCH_GAP_AND_ROADMAP.md`:
+  - lambda_pde=0.0  -> N0, the unstructured control. Only fit to the
+    terminal payoff and the two boundary conditions; nothing constrains the
+    interior, so it has no reason to match the BS PDE away from tau=0.
+  - lambda_pde>0.0  -> N1, the physics-informed model. Same network, same
+    terminal/boundary data, plus the PDE residual penalty everywhere in the
+    interior.
+Comparing N0 vs N1 interior error is the Phase 3 ablation: it's the direct,
+checkable evidence that the physics loss is doing something, not just a
+theoretical claim.
+
+`AmericanPINNConfig.weighting_scheme` is N2's own ablation (Section 5/6 of
+the roadmap: self-adaptive weighting is a training detail to fold into N2's
+config, not a standalone phase) -- see `train_american.py` for what each of
+"fixed", "curriculum", and "self_adaptive" actually does.
+
+`HestonEuropeanPINNConfig` is Phase 3b's first step: the same N0/N1 idea
+(`lambda_pde` switch) but under Heston's two-factor dynamics instead of
+GBM -- validated against the closed-form `ivuq.pricing.heston.heston_price`
+rather than Black-Scholes. This is deliberately built and checked against a
+known solution *before* attempting the American-Heston free-boundary PINN,
+which has no closed form to validate against at all.
+
+`AmericanHestonPINNConfig` is Phase 3b's centerpiece, N2-Heston: the coupled
+solution+boundary network in `heston_free_boundary.py`, validated against
+the LSMC reference (`ivuq.pricing.heston_lsmc.lsmc_american_heston_price`)
+since no closed form exists. Put only -- see that module's docstring for
+why -- so unlike every other config here it has no `option_type` field.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = ["EuropeanPINNConfig", "AmericanPINNConfig", "HestonEuropeanPINNConfig", "AmericanHestonPINNConfig"]
+
+
+@dataclass
+class EuropeanPINNConfig:
+    option_type: str = "put"
+
+    # Black-Scholes parameters this instance is trained for.
+    r: float = 0.03
+    q: float = 0.0
+    sigma: float = 0.2
+
+    # Domain: moneyness m=S/K in [0, m_max], time-to-expiry tau in [0, tau_max].
+    m_max: float = 3.0
+    tau_max: float = 1.0
+
+    # Network shape.
+    hidden_layers: int = 4
+    hidden_width: int = 64
+
+    # Collocation point counts, resampled every epoch. Terminal points are
+    # sampled half uniform, half concentrated near the payoff kink at m=1
+    # (see `collocation.sample_terminal`) -- the kink is the hardest part of
+    # the domain for a smooth network to fit, so it gets extra resolution.
+    n_interior: int = 3000
+    n_terminal: int = 400
+    n_boundary: int = 200
+
+    # Loss weights. See module docstring for what lambda_pde=0 means.
+    # Terminal is weighted above 1 because it's what pins the PDE down to
+    # *this* solution rather than some other function satisfying the PDE
+    # and the two spatial boundary conditions.
+    lambda_pde: float = 1.0
+    lambda_terminal: float = 3.0
+    lambda_boundary: float = 1.0
+
+    lr: float = 2e-3
+    lr_decay_every: int = 2000  # halve lr every this many epochs, 0 disables
+    epochs: int = 6000
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.option_type not in ("call", "put"):
+            raise ValueError(f"option_type must be 'call' or 'put', got {self.option_type!r}")
+
+
+@dataclass
+class AmericanHestonPINNConfig:
+    # Rates and Heston's own five parameters, same meaning as HestonEuropeanPINNConfig.
+    r: float = 0.03
+    q: float = 0.0
+    kappa: float = 2.0
+    theta: float = 0.04
+    xi: float = 0.4
+    rho: float = -0.5
+    v0: float = 0.04
+
+    # Domain, same convention as HestonEuropeanPINNConfig.
+    m_max: float = 3.0
+    v_max: float = 0.16
+    tau_max: float = 1.0
+
+    # Solution network: 3D input (m, v, tau), same shape as N1-Heston's.
+    sol_hidden_layers: int = 4
+    sol_hidden_width: int = 64
+    # Boundary network: 2D input (v, tau) -- a single surface, a simpler
+    # function to represent than the full price field, so smaller by default.
+    bnd_hidden_layers: int = 3
+    bnd_hidden_width: int = 32
+
+    # Collocation point counts, resampled every epoch.
+    n_interior: int = 4000
+    n_boundary_vt: int = 400  # value-matching / smooth-pasting / terminal-b points
+    n_terminal: int = 500  # solution-net terminal (tau=0) points
+    n_boundary_m_max: int = 200
+    n_boundary_v_max: int = 200
+
+    # Loss weights. No N0/N1 switch here (there's no meaningful "control"
+    # version of a free-boundary problem the way there is for a plain PDE
+    # fit) -- lambda_pde is always on. lambda_obstacle is weighted well
+    # above the rest: empirically, at 1.0 the mid-domain PDE fit sags below
+    # intrinsic value (down to several dollars negative on a $100 strike)
+    # while it's still converging, since nothing else in this formulation
+    # penalizes that the way the LCP's own obstacle term does for GBM/N2 --
+    # 5.0 keeps that from happening without needing the PDE fit itself to
+    # already be tight everywhere.
+    lambda_pde: float = 1.0
+    lambda_obstacle: float = 5.0
+    lambda_value_matching: float = 1.0
+    lambda_smooth_pasting: float = 1.0
+    lambda_terminal_u: float = 3.0
+    lambda_terminal_b: float = 3.0
+    lambda_boundary_m_max: float = 1.0
+    lambda_boundary_v_max: float = 1.0
+
+    lr: float = 2e-3
+    lr_decay_every: int = 2000
+    epochs: int = 6000
+    seed: int = 0
+
+
+@dataclass
+class AmericanPINNConfig:
+    option_type: str = "put"
+
+    # Black-Scholes parameters this instance is trained for.
+    r: float = 0.03
+    q: float = 0.0
+    sigma: float = 0.2
+
+    # Domain: moneyness m=S/K in [0, m_max], time-to-expiry tau in [0, tau_max].
+    m_max: float = 3.0
+    tau_max: float = 1.0
+
+    # Network shape.
+    hidden_layers: int = 4
+    hidden_width: int = 64
+
+    # Collocation point counts. Under "fixed"/"curriculum" these are
+    # resampled fresh every epoch, same as the European PINN. Under
+    # "self_adaptive" the interior points are sampled once and held fixed
+    # for the whole run -- see train_american.py for why.
+    n_interior: int = 3000
+    n_terminal: int = 400
+    n_boundary: int = 200
+
+    # Fixed loss weights for the two data-fit terms (terminal payoff, the
+    # two spatial boundaries). These stay plain scalars under every
+    # weighting scheme -- they live on lower-dimensional slices with no
+    # free boundary to resolve, so there's nothing for spatial adaptivity
+    # to buy here.
+    lambda_terminal: float = 3.0
+    lambda_boundary: float = 1.0
+
+    # Fixed loss weights for the three LCP penalty terms (free_boundary.py
+    # equation (3)): ineq_violation, obstacle_violation, complementarity_violation.
+    # Under "fixed" these are used as-is. Under "curriculum" they're the
+    # *target* weights the ramp climbs to. Under "self_adaptive" they're
+    # ignored for the interior terms -- per-point trainable weights replace
+    # them (see train_american.py).
+    lambda_ineq: float = 1.0
+    lambda_obstacle: float = 1.0
+    lambda_complementarity: float = 1.0
+
+    # Which of the three loss-weighting strategies to train with -- the
+    # Phase 3 ablation. "fixed": constant weights above, fresh collocation
+    # every epoch (same recipe as the European PINN). "curriculum": weights
+    # ramp up linearly over the first `curriculum_ramp_epochs`, plus
+    # resampling shifts to concentrate points near the current estimated
+    # exercise boundary once the ramp is under way. "self_adaptive": a
+    # simplified, points-only version of McClenny & Braga-Neto
+    # (arXiv:2009.04544) -- trainable per-point weights on the three LCP
+    # terms, updated by gradient ascent so the network can't just ignore
+    # persistently-hard points (e.g. near the free boundary).
+    weighting_scheme: str = "fixed"
+
+    # "curriculum" only: ramp lambda_ineq/obstacle/complementarity linearly
+    # from curriculum_start_frac*target to target over this many epochs.
+    curriculum_ramp_epochs: int = 1500
+    curriculum_start_frac: float = 0.1
+
+    # v2 (results/uq/paper_v2/DIAGNOSIS.md). Both default to the v1 behaviour,
+    # so the v1 models and every existing test are unchanged.
+    # lcp_form: how the complementarity condition L[u](u-h)=0 is penalised.
+    #   "product" (v1): complementarity_violation = L[u] * (u - h). Weak where
+    #       u - h is small, so a supersolution with L[u] > 0 in the continuation
+    #       region costs almost nothing (the v1 N2 upward bias).
+    #   "min": complementarity_violation = min(L[u], u - h), the standard
+    #       min-form of the LCP. It is zero iff the LCP holds and penalises
+    #       L[u] > 0 at full strength wherever u is above the obstacle.
+    lcp_form: str = "product"
+    # american_low_boundary: put value imposed at m = 0. False (v1) uses the
+    # European value exp(-r tau); True uses the American value 1 (immediate
+    # exercise of a put at S = 0 pays K), consistent with u >= h.
+    american_low_boundary: bool = False
+
+    lr: float = 2e-3
+    lr_decay_every: int = 2000  # halve lr every this many epochs, 0 disables
+    epochs: int = 6000
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.option_type not in ("call", "put"):
+            raise ValueError(f"option_type must be 'call' or 'put', got {self.option_type!r}")
+        if self.lcp_form not in ("product", "min"):
+            raise ValueError(f"lcp_form must be 'product' or 'min', got {self.lcp_form!r}")
+        if self.weighting_scheme not in ("fixed", "curriculum", "self_adaptive"):
+            raise ValueError(
+                "weighting_scheme must be 'fixed', 'curriculum', or 'self_adaptive', "
+                f"got {self.weighting_scheme!r}"
+            )
+
+
+@dataclass
+class HestonEuropeanPINNConfig:
+    option_type: str = "put"
+
+    # Rates and Heston's own five parameters.
+    r: float = 0.03
+    q: float = 0.0
+    kappa: float = 2.0     # mean-reversion speed of variance
+    theta: float = 0.04    # long-run variance
+    xi: float = 0.4        # vol-of-vol
+    rho: float = -0.5      # correlation between the two Brownian motions
+    v0: float = 0.04       # initial variance -- used at inference (.price()), not sampled in training
+
+    # Domain: moneyness m=S/K in [0, m_max], variance v in [0, v_max],
+    # time-to-expiry tau in [0, tau_max]. v_max needs to comfortably cover
+    # where theta/v0 and their fluctuations under kappa/xi actually live --
+    # 4x theta is a generous default, not a tuned one.
+    m_max: float = 3.0
+    v_max: float = 0.16
+    tau_max: float = 1.0
+
+    # Network shape. One more input dimension than EuropeanPINNConfig (m, v,
+    # tau instead of m, tau); see network.PINN's in_dim parameter.
+    hidden_layers: int = 4
+    hidden_width: int = 64
+
+    # Collocation point counts, resampled every epoch.
+    n_interior: int = 4000
+    n_terminal: int = 500
+    n_boundary_m: int = 200
+    n_boundary_v: int = 200
+
+    # Loss weights. lambda_pde=0 gives N0-Heston (the control); >0 gives
+    # N1-Heston. Same rationale as EuropeanPINNConfig for why terminal is
+    # weighted above 1.
+    lambda_pde: float = 1.0
+    lambda_terminal: float = 3.0
+    lambda_boundary_m: float = 1.0
+    lambda_boundary_v: float = 1.0
+
+    lr: float = 2e-3
+    lr_decay_every: int = 2000
+    epochs: int = 6000
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.option_type not in ("call", "put"):
+            raise ValueError(f"option_type must be 'call' or 'put', got {self.option_type!r}")
